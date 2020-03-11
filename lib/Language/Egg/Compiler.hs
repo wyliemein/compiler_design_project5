@@ -59,10 +59,10 @@ compile (Prog ds e) = compileBody emptyEnv e
                       ++ concatMap compileDecl ds
 
 compileDecl :: ADcl -> [Instruction]
-compileDecl (Decl f xs e l) = [ ILabel (DefFun (bindId f))] ++  compileBody (paramsEnv xs) e
-
-paramsEnv :: [Bind a] -> Env
-paramsEnv xs = fromListEnv (zip (bindId <$> xs) [-2, -3..])
+compileDecl (Decl f xs e _) = ILabel (Builtin (bindId f))
+                            : compileBody env e
+  where
+    env                     = fromListEnv (zip (bindId <$> xs) [-2, -3..])
 
 compileBody :: Env -> AExp -> [Instruction]
 compileBody env e = funInstrs (countVars e) (compileEnv env e)
@@ -83,20 +83,13 @@ funEntry :: Int -> [Instruction]
 funEntry n = [ IPush (Reg EBP)
               , IMov  (Reg EBP) (Reg ESP)
               , ISub  (Reg ESP) (Const (4 * n))
+              , IAnd  (Reg ESP) (HexConst 0xFFFFFFF0) -- MACOS stack alignment
               ]
 
 -- FILL: clean up stack & labels for jumping to error
 funExit :: [Instruction]
 funExit = [ IMov (Reg ESP) (Reg EBP)
           , IPop  (Reg EBP)
-          ]
-
-
--- Prelude: Intialize ESI with start position of Heap passed in by the runtime
-prelude :: [Instruction]
-prelude = [ IMov (Reg ESI) (RegOffest 4 ESP)
-          , IAdd (Reg ESI) (Const 8)
-          , I and (Reg ESI) (HexConst 0xfffffff8)
           ]
 
 --------------------------------------------------------------------------------
@@ -112,168 +105,61 @@ countVars _              = 0
 --------------------------------------------------------------------------------
 compileEnv :: Env -> AExp -> [Instruction]
 --------------------------------------------------------------------------------
-compileEnv env v@Number {}       = [ compileImm env v  ]
+compileEnv env v@(Number {})     = [ compileImm env v  ]
 
-compileEnv env v@Boolean {}      = [ compileImm env v  ]
+compileEnv env v@(Boolean {})    = [ compileImm env v  ]
 
-compileEnv env v@Id {}           = [ compileImm env v  ]
+compileEnv env v@(Id {})         = [ compileImm env v  ]
 
-compileEnv env e@Let {}          = is ++ compileEnv env' body
+compileEnv env e@(Let {})        = is ++ compileEnv env' body
   where
     (env', is)                   = compileBinds env [] binds
     (binds, body)                = exprBinds e
 
-compileEnv env (Prim1 o v l)     = compilePrim1 l env o v
+compileEnv env (Prim1 o v l)     = compilePrim1 (annTag l) env o v
 
-compileEnv env (Prim2 o v1 v2 l) = compilePrim2 l env o v1 v2
+compileEnv env (Prim2 o v1 v2 l) = compilePrim2 (annTag l) env o v1 v2
 
-compileEnv env (If v e1 e2 l)    = compileIf l env v e1 e2
-
-compileEnv env (App f vs l)
-  | annTail l                    = tailcall (DefFun f) (param env <$> vs)
-  | otherwise                    = call (DefFun f) (param env <$> vs)
-
-compileEnv env (Tuple v1 v2)      = compieExpr env v1 v2
-
-call :: Label -> [Arg] -> [Instruction]
-call f a = concatMap push (reverse a) ++
-           [ ICall f
-           , IAdd (Reg ESP) (Const (4 * n))]
+compileEnv env (If v e1 e2 l)    = assertType env v TBoolean
+                                ++ IMov (Reg EAX) (immArg env v)
+                                 : ICmp (Reg EAX) (repr False)
+                                 : branch (annTag l) IJe i1s i2s
   where
-    n        = length a
-    push arg = [ IPush arg]
+    i1s                          = compileEnv env e1
+    i2s                          = compileEnv env e2
 
-
-tailcall :: Label -> [Arg] -> [Instruction]
-tailcall f a = concatMap move (zip a [0,1..]) ++
-               [ IMov (Reg ESP) (Reg EBP)
-               , IPop (Reg EBP)
-               , IJmp f]
+compileEnv env (Tuple es _)      = [ IMov (Reg EAX) (Reg ESI)
+                                   , IAdd (Reg ESI) (Const (i*4))
+                                   , IMov (Reg EBX) (Const len)
+                                   , IMov (Sized DWordPtr (RegOffset 0 EAX)) (Reg EBX)]                                
+                                  ++ concatMap tupleCopy (zip es [0,1..]) ++
+                                   [ IOr (Reg EAX) (typeTag TTuple)]
   where
-    move (arg,n) = [ IMov (Reg EAX)              arg 
-                   , IMov (RegOffset (8+n*4) EBP)  (Reg EAX)]
- 
--------------------------------------------------------------------------------
-compilePrim1 :: Ann -> Env -> Prim1 -> IExp -> [Instruction]
-compilePrim1 _ env Add1 v = assertType env v TNumber 
-                            ++ [ IAdd (Reg EAX) (Const 2) 
-                               , IJo (DynamicErr ArithOverflow)]
-compilePrim1 _ env Sub1 v = assertType env v TNumber  
-                            ++ [ IAdd (Reg EAX) (Const (-2)) 
-                               , IJo (DynamicErr ArithOverflow)]
-compilePrim1 _ env Print v = compileEnv env v ++
-                             [ IMov (Reg EBX) (Reg EAX)
-                             , IPush (Reg EBX)
-                             , ICall (Builtin "print")]
-compilePrim1 _ env IsNum v = compileEnv env v ++
-                            [ IAnd (Reg EAX) (HexConst 0x00000001)      
-                            , IShl (Reg EAX) (Const 31)
-                            , IOr  (Reg EAX) (typeMask TBoolean)
-                            , IXor (Reg EAX) (HexConst 0x80000000)]
-compilePrim1 _ env IsBool v = compileEnv env v ++
-                            [ IAnd (Reg EAX) (HexConst 0x00000001)
-                            , IShl (Reg EAX) (Const 31)
-                            , IOr  (Reg EAX) (typeMask TBoolean)]
+    len                          = length es
+    i                            = if even len then (len+2)
+                                   else (len+1)
+    tupleCopy (e,n)              = [ IMov (Reg EBX) (immArg env e)
+                                   , IMov (pairAddr (n+1)) (Reg EBX)]
+                                   
+
+compileEnv env (GetItem vE vI _) = assertType env vE TTuple ++
+                                 [ IMov (Reg EAX) (immArg env vE)
+                                 , ISub (Reg EAX) (typeTag TTuple)
+                                 , IMov (Reg EAX) (Sized DWordPtr (RegOffset (2*(i+2)) EAX))]
+  where
+   Const i                       = immArg env vI 
+
+compileEnv env (App f vs _)      = call (Builtin f) (param env <$> vs)
 
 
-compilePrim2 :: Ann -> Env -> Prim2 -> IExp -> IExp -> [Instruction]
-compilePrim2 _ env Plus v1 v2 = assertType env v1 TNumber
-                                ++ assertType env v2 TNumber
-                                ++ [ IMov (Reg EAX) (immArg env v1)
-                                , IAdd (Reg EAX) (immArg env v2)
-                                , IJo (DynamicErr ArithOverflow)]
-compilePrim2 _ env Minus v1 v2  = assertType env v1 TNumber
-                                ++ assertType env v2 TNumber
-                                ++ [ IMov (Reg EAX) (immArg env v1)
-                                , ISub (Reg EAX) (immArg env v2)
-                                , IJo (DynamicErr ArithOverflow)]
-compilePrim2 _ env Times v1 v2  = assertType env v1 TNumber
-                                ++ assertType env v2 TNumber
-                                ++ [ IMov (Reg EAX) (immArg env v1)
-                                , IMul (Reg EAX) (immArg env v2)
-                                , IJo (DynamicErr ArithOverflow)
-                                , ISar (Reg EAX) (Const 1)]
-
-compilePrim2 _ env Greater v1 v2  = assertType env v1 TNumber
-                                  ++ assertType env v2 TNumber
-                                  ++ [ IMov (Reg EAX) (immArg env v2)
-                                  , ISub (Reg EAX) (immArg env v1)
-                                  , IAnd (Reg EAX) (HexConst 0x80000000)
-                                  , IOr  (Reg EAX) (typeMask TBoolean)
-                                  ]
-
-compilePrim2 _ env Less v1 v2  = assertType env v1 TNumber
-                                  ++ assertType env v2 TNumber
-                                  ++ [ IMov (Reg EAX) (immArg env v1)
-                                  , ISub (Reg EAX) (immArg env v2)
-                                  , IAnd (Reg EAX) (HexConst 0x80000000)
-                                  , IOr  (Reg EAX) (typeMask TBoolean)
-                                  ]
-
-compilePrim2 l env Equal v1 v2  = assertType env v1 TNumber
-                                ++ assertType env v2 TNumber
-                                ++ [ IMov (Reg EAX) (immArg env v1)
-                                , ICmp (Reg EAX) (immArg env v2)
-                                , IJe (BranchTrue (annTag l))
-                                , IMov (Reg EAX) (repr False)
-                                , IJmp (BranchDone (annTag l))
-                                , ILabel (BranchTrue (annTag l))
-                                , IMov (Reg EAX) (repr True)
-                                , ILabel (BranchDone (annTag l))
-                                ]
-                    
-compileExpr env (Tuple v1 v2) = pairAlloc 
-                                ++ pairCopy First (immArg env v1) 
-                                ++ pairCopy Second (immArg env v2) 
-                                ++ setTag (Reg EAX) (TPair)
-
-pairAlloc :: Asm 
-pairAlloc = [ IMov (Reg EAX) (Reg ESI)
-            , IAdd (Reg ESI) (Const 8)
-            ]
-
-pairCopy :: Field -> Arg -> Asm
-pairCopy fld a = [ IMov (Reg EBX) a
-                  , IMov (pairAddr fld) (Reg EBX)
-                  ]
-
-pairAddr :: Field -> Arg
-pairAddr fld = Sized DwordPtr (RegOffset (4 * fieldOffset fld) EAX)
-
-fieldOffset :: Field -> Int
-fieldOffset First = 0
-fieldOffset Second = 1
-
-
-compileIf :: Ann -> Env -> IExp -> AExp -> AExp -> [Instruction]
-compileIf l env v e1 e2 = assertType env v TBoolean
-                          ++ [ IMov (Reg EAX) (immArg env v) 
-                             , ICmp (Reg EAX) (repr True)
-                             , IJe (BranchTrue (annTag l))
-                             ]
-                          ++ compileEnv env e2
-                          ++ [ IJmp   (BranchDone (annTag l))
-                             , ILabel (BranchTrue (annTag l))
-                             ]
-                          ++ compileEnv env e1
-                          ++ [ ILabel (BranchDone (annTag l)) ]
-
-assertType :: Env -> IExp -> Ty -> [Instruction]
-assertType env v ty
-  = [ IMov (Reg EAX) (immArg env v)
-    , IMov (Reg EBX) (Reg EAX)
-    , IAnd (Reg EBX) (typeMask ty)
-    , ICmp (Reg EBX) (typeTag  ty)
-    , IJne (DynamicErr (TypeError ty))]
-
----------------------------------------------------------------------
+pairAddr n                      = Sized DWordPtr (RegOffset (4*n) EAX)
 
 compileImm :: Env -> IExp -> Instruction
 compileImm env v = IMov (Reg EAX) (immArg env v)
 
 compileBinds :: Env -> [Instruction] -> [(ABind, AExp)] -> (Env, [Instruction])
 compileBinds env is []     = (env, is)
-compileBinds env is (b:bs) = compileBinds env' (is <> is') bs
+compileBinds env is (b:bs) = compileBinds env' (is ++ is') bs
   where
     (env', is')            = compileBind env b
 
@@ -281,8 +167,38 @@ compileBind :: Env -> (ABind, AExp) -> (Env, [Instruction])
 compileBind env (x, e) = (env', is)
   where
     is                 = compileEnv env e
-                      <> [IMov (stackVar i) (Reg EAX)]
+                      ++ [IMov (stackVar i) (Reg EAX)]
     (i, env')          = pushEnv x env
+
+compilePrim1 :: Tag -> Env -> Prim1 -> IExp -> [Instruction]
+compilePrim1 l env Add1    v = assertType env v TNumber 
+                                ++ [ IAdd (Reg EAX) (Const 2) 
+                                , IJo (DynamicErr ArithOverflow)]
+compilePrim1 l env Sub1    v = assertType env v TNumber  
+                                ++ [ IAdd (Reg EAX) (Const (-2)) 
+                                , IJo (DynamicErr ArithOverflow)]
+compilePrim1 l env IsNum   v = compileEnv env v ++
+                             [ IAnd (Reg EAX) (typeMask TNumber)
+                             , IShl (Reg EAX) (Const 31)
+                             , IOr  (Reg EAX) (typeTag TBoolean)
+                             , IXor (Reg EAX) (HexConst 0x80000000)]
+compilePrim1 l env IsBool  v = compileEnv env v ++
+                            [ IAnd (Reg EAX) (typeMask TBoolean)
+                            , IShl (Reg EAX) (Const 31)
+                            , IOr  (Reg EAX) (typeTag TBoolean)]
+compilePrim1 l env IsTuple v = compileEnv env v ++
+                            [ IAnd (Reg EAX) (typeMask TTuple)
+                            , IShl (Reg EAX) (Const 31)
+                            , IOr  (Reg EAX) (typeTag TBoolean)]
+compilePrim1 _ env Print   v = call (Builtin "print") [param env v]
+
+compilePrim2 :: Tag -> Env -> Prim2 -> IExp -> IExp -> [Instruction]
+compilePrim2 _ env Plus    = arith     env addOp
+compilePrim2 _ env Minus   = arith     env subOp
+compilePrim2 _ env Times   = arith     env mulOp
+compilePrim2 l env Less    = compare l env IJl (Just TNumber)
+compilePrim2 l env Greater = compare l env IJg (Just TNumber)
+compilePrim2 l env Equal   = compare l env IJe Nothing
 
 immArg :: Env -> IExp -> Arg
 immArg _   (Number n _)  = repr n
@@ -292,10 +208,128 @@ immArg env e@(Id x _)    = stackVar (fromMaybe err (lookupEnv x env))
     err                  = abort (errUnboundVar (sourceSpan e) x)
 immArg _   e             = panic msg (sourceSpan e)
   where
-    msg                  = "Unexpected non-immExpr in immArg: " <> show (void e)
+    msg                  = "Unexpected non-immExpr in immArg: " ++ show (strip e)
+
+strip = fmap (const ())
+
+--------------------------------------------------------------------------------
+-- | Arithmetic
+--------------------------------------------------------------------------------
+arith :: Env -> AOp -> IExp -> IExp  -> [Instruction]
+--------------------------------------------------------------------------------
+arith env aop v1 v2
+  =  assertType env v1 TNumber
+  ++ assertType env v2 TNumber
+  ++ IMov (Reg EAX) (immArg env v1)
+   : IMov (Reg EBX) (immArg env v2)
+   : aop (Reg EAX) (Reg EBX)
+
+addOp :: AOp
+addOp a1 a2 = [ IAdd a1 a2
+              , overflow
+              ]
+
+subOp :: AOp
+subOp a1 a2 = [ ISub a1 a2
+              , overflow
+              ]
+
+mulOp :: AOp
+mulOp a1 a2 = [ IMul a1 a2
+              , overflow
+              , ISar a1 (Const 1)
+              ]
+
+overflow :: Instruction
+overflow = IJo (DynamicErr ArithOverflow)
+
+--------------------------------------------------------------------------------
+-- | Dynamic Tests
+--------------------------------------------------------------------------------
+
+-- | @assertType t@ tests if EAX is a value of type t and exits with error o.w.
+assertType :: Env -> IExp -> Ty -> [Instruction]
+assertType env v ty
+  =   cmpType env v ty
+  ++ [ IJne (DynamicErr (TypeError ty))    ]
+
+cmpType :: Env -> IExp -> Ty -> [Instruction]
+cmpType env v ty
+  = [ IMov (Reg EAX) (immArg env v)
+    , IMov (Reg EBX) (Reg EAX)
+    , IAnd (Reg EBX) (typeMask ty)
+    , ICmp (Reg EBX) (typeTag  ty)
+    ]
+
+--------------------------------------------------------------------------------
+-- | Comparisons
+--------------------------------------------------------------------------------
+-- | @compare v1 v2@ generates the instructions at the
+--   end of which EAX is TRUE/FALSE depending on the comparison
+--------------------------------------------------------------------------------
+compare :: Tag -> Env -> COp -> Maybe Ty -> IExp -> IExp -> [Instruction]
+compare l env j t v1 v2
+  =  compareCheck env t v1 v2
+  ++ compareVal l env j v1 v2
+
+compareCheck :: Env -> Maybe Ty -> IExp -> IExp -> [Instruction]
+compareCheck _   Nothing  _  _
+  =  []
+compareCheck env (Just t) v1 v2
+  =  assertType env v1 t
+  ++ assertType env v2 t
+
+compareVal :: Tag -> Env -> COp -> IExp -> IExp -> [Instruction]
+compareVal l env j v1 v2
+   = IMov (Reg EAX) (immArg env v1)
+   : IMov (Reg EBX) (immArg env v2)
+   : ICmp (Reg EAX) (Reg EBX)
+   : boolBranch l j
+
+--------------------------------------------------------------------------------
+-- | Assignment
+--------------------------------------------------------------------------------
+assign :: (Repr a) => Reg -> a -> Instruction
+assign r v = IMov (Reg r) (repr v)
+
+--------------------------------------------------------------------------------
+-- | Function call
+--------------------------------------------------------------------------------
+call :: Label -> [Arg] -> [Instruction]
+call f args
+  =    ISub (Reg ESP) (Const (4 * k))
+  :  [ IPush a | a <- reverse args ]
+  ++ [ ICall f
+     , IAdd (Reg ESP) (Const (4 * (n + k)))  ]
+  where
+    n = length args
+    k = 4 - (n `mod` 4)
 
 param :: Env -> IExp -> Arg
 param env v = Sized DWordPtr (immArg env v)
+
+--------------------------------------------------------------------------------
+-- | Branching
+--------------------------------------------------------------------------------
+branch :: Tag -> COp -> [Instruction] -> [Instruction] -> [Instruction]
+branch l j falseIs trueIs = concat
+  [ [ j lTrue ]
+  , falseIs
+  , [ IJmp lDone
+    , ILabel lTrue  ]
+  , trueIs
+  , [ ILabel lDone ]
+  ]
+  where
+    lTrue = BranchTrue i
+    lDone = BranchDone i
+    i     = l
+
+boolBranch :: Tag -> COp -> [Instruction]
+boolBranch l j = branch l j [assign EAX False] [assign EAX True]
+
+type AOp = Arg -> Arg -> [Instruction]
+type COp = Label -> Instruction
 
 stackVar :: Int -> Arg
 stackVar i = RegOffset (-4 * i) EBP
@@ -327,6 +361,3 @@ typeMask :: Ty -> Arg
 typeMask TNumber  = HexConst 0x00000001
 typeMask TBoolean = HexConst 0x7fffffff
 typeMask TTuple   = HexConst 0x00000007
-
-setTag :: Register -> Ty -> Asm
-setTag r ty = [IAdd (Reg r) (typrTag ty) ]

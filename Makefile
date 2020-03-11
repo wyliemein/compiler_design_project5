@@ -15,7 +15,6 @@ GHCICOMMAND=$(STACKEXEC) ghci
 
 # Max 5 seconds, 500 MB of memory and 50 MB of file
 LIMIT=./limit.sh 10 500 50
-VALGRIND=valgrind --error-exitcode=1
 
 UNAME := $(shell uname)
 ifeq ($(UNAME), Linux)
